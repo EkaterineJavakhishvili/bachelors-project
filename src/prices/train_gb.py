@@ -6,15 +6,18 @@ import joblib
 
 
 def train_gb(ticker: str = TICKER):
-    train = pd.read_parquet(PROC_PRICES / f"{ticker}_rf_train.parquet")
-    val = pd.read_parquet(PROC_PRICES / f"{ticker}_rf_val.parquet")
-    test = pd.read_parquet(PROC_PRICES / f"{ticker}_rf_test.parquet")
+    train = pd.read_parquet(PROC_PRICES / f"{ticker}_train.parquet")
+    val = pd.read_parquet(PROC_PRICES / f"{ticker}_val.parquet")
+    test = pd.read_parquet(PROC_PRICES / f"{ticker}_test.parquet")
 
-    TARGET = "next_close"
-    Xcols = [c for c in train.columns if c != TARGET]
+    # !!! CHANGED TARGET !!!
+    TARGET = "target_return"
+
+    # Features are everything EXCEPT target and the helper 'price_today'
+    Xcols = [c for c in train.columns if c not in [TARGET, "price_today"]]
 
     gb = GradientBoostingRegressor(
-        n_estimators=500, learning_rate=0.05, max_depth=5, random_state=42
+        n_estimators=200, learning_rate=0.05, max_depth=10, random_state=42
     )
     gb.fit(train[Xcols], train[TARGET])
 
