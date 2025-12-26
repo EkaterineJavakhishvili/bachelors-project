@@ -1,47 +1,71 @@
 """
-Evaluation and plotting for price models
+Evaluation and plotting for price models (Reconstructed from Returns)
 """
 
 import pandas as pd
+import numpy as np
 import joblib
 import matplotlib.pyplot as plt
-from src.config import PROC_PRICES, MODELS_DIR, FIG_DIR, TICKER, INT_PRICES
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from src.config import PROC_PRICES, MODELS_DIR, FIG_DIR, TICKER
 
-
-TARGET = "next_close"
+# !!! CHANGED TARGET !!!
+TARGET = "target_return"
 
 
 def evaluate_and_plot(ticker: str = TICKER):
-    # load model and test split 
-    # (!!! CHANGE DEPENDING ON WHICH MODEL YOU'RE USING !!!)
-    rf = joblib.load(MODELS_DIR / "linear_regression.pkl")
-    test = pd.read_parquet(PROC_PRICES / f"{ticker}_rf_test.parquet")
+    # Load model (Swap this for 'gradient_boosting.pkl' or 'linear_regression.pkl' to test others)
+    model_name = "linear_regression.pkl"
+    model = joblib.load(MODELS_DIR / model_name)
 
-    # guard against NaNs
-    Xcols = [c for c in test.columns if c != TARGET]
+    test = pd.read_parquet(PROC_PRICES / f"{ticker}_test.parquet")
+
+    # Features: Exclude target and helper column
+    Xcols = [c for c in test.columns if c not in [TARGET, "price_today"]]
     test = test.dropna(subset=Xcols + [TARGET]).copy()
 
-    # predict
-    y_true = test[TARGET].values
-    y_pred = rf.predict(test[Xcols])
+    # 1. Predict Returns
+    # The model outputs: "I think price will change by +0.01 (1%)"
+    pred_log_returns = model.predict(test[Xcols])
+
+    # 2. Reconstruct Prices
+    # Formula: Price_Tomorrow = Price_Today * exp(Log_Return)
+    # We use the 'price_today' column we saved in features.py
+    test["pred_price"] = test["price_today"] * np.exp(pred_log_returns)
+    test["actual_price"] = test["price_today"] * np.exp(test[TARGET])
+
+    # 3. Calculate Metrics on PRICES (Real world accuracy)
+    y_true = test["actual_price"]
+    y_pred = test["pred_price"]
+
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = mean_squared_error(y_true, y_pred) ** 0.5
+    r2 = r2_score(y_true, y_pred)
+
+    print(f"--- RECONSTRUCTED PRICE METRICS ({model_name}) ---")
+    print(f"[TEST] MAE={mae:.3f}  RMSE={rmse:.3f}  R2={r2:.3f}")
+
+    # 4. Plot
     dates = pd.to_datetime(test.index)
 
-    # plot
     FIG_DIR.mkdir(parents=True, exist_ok=True)
-    out = FIG_DIR / "rf_predictions_test.png"
-    plt.figure(figsize=(12, 4))
-    plt.plot(dates, y_true, label="Actual")
-    plt.plot(
-        dates, y_pred, label="Prediction", linestyle="--", marker="x", markersize=2
+    out = FIG_DIR / f"pred_{model_name.replace('.pkl', '')}.png"
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(dates, y_true, label="Actual Price", linewidth=2)
+    plt.plot(dates, y_pred, label="Predicted Price", linestyle="--", color="orange")
+
+    plt.title(
+        f"Prediction vs Actual ({ticker}) • Reconstructed from Returns • {model_name}"
     )
-    plt.title(f"RF Predictions vs Actual ({ticker}) • TEST")
     plt.xlabel("Date")
-    plt.ylabel("Close")
+    plt.ylabel("Close Price")
     plt.legend()
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(out, dpi=160)
     plt.close()
-    print(f"Figure → {out}")
+    print(f"Figure saved -> {out}")
 
 
 if __name__ == "__main__":
