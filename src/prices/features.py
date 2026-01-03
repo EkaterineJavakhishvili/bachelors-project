@@ -1,67 +1,94 @@
 import pandas as pd
 import numpy as np
 import pandas_ta as ta
-from src.config import INT_PRICES, PROC_PRICES, TICKER, TEST_RATIO, VAL_RATIO
+from src.config import DATA_DIR
 
 
-def build_features(ticker: str = TICKER):
-    """
-    Builds features using pandas_ta with robust cleaning for Infinite values.
-    """
-    # 1. Load Data
-    df = pd.read_parquet(INT_PRICES / f"{ticker}.parquet").copy()
+def build_features(ticker="AAPL"):
+    print(f"Building features for {ticker}...")
 
-    # --- 2. BASE CALCULATIONS ---
-    df["log_return"] = np.log(df["Close"] / df["Close"].shift(1))
+    # 1. Load Price Data
+    price_path = DATA_DIR / "raw" / "prices" / f"{ticker}.csv"
+    if not price_path.exists():
+        print(f"❌ Price data not found: {price_path}")
+        return
 
-    # --- 3. TECHNICAL INDICATORS (via pandas_ta) ---
-    # RSI (14)
-    df.ta.rsi(length=14, append=True)
+    df = pd.read_csv(price_path)
 
-    # MACD (12, 26, 9)
-    df.ta.macd(fast=12, slow=26, signal=9, append=True)
+    # --- FIX: Standardize Column Names (Handle date vs Date, close vs Close) ---
+    # This ensures the script works even if your CSV has lowercase names
+    df = df.rename(
+        columns={
+            "date": "Date",
+            "close": "Close",
+            "high": "High",
+            "low": "Low",
+            "open": "Open",
+            "volume": "Volume",
+        }
+    )
 
-    # ATR (14)
-    df.ta.atr(length=14, append=True)
+    # Ensure Date is actually a column (if it was the index, reset it)
+    if "Date" not in df.columns and isinstance(df.index, pd.DatetimeIndex):
+        df = df.reset_index()
+        df = df.rename(columns={"index": "Date"})
 
-    # --- 4. NORMALIZATION & CLEANUP ---
-    # Normalize RSI (0-100 -> 0-1)
-    df["rsi_norm"] = df["RSI_14"] / 100.0
+    # ---------------------------------------------------------------------------
 
-    # Normalize ATR (Relative to price)
-    df["atr_rel"] = df["ATRr_14"] / df["Close"]
+    df["Date"] = pd.to_datetime(df["Date"], utc=True).dt.date
+    df = df.set_index("Date").sort_index()
 
-    # MACD Histogram
-    df["macd_hist"] = df["MACDh_12_26_9"]
+    # 2. Calculate Returns (Input Features)
+    df["return_lag1"] = df["Close"].pct_change()
+    df["return_lag2"] = df["Close"].pct_change(2)
+    df["return_lag3"] = df["Close"].pct_change(3)
+    df["return_lag5"] = df["Close"].pct_change(5)
 
-    # Rolling Volatility
-    df["volatility_20"] = df["log_return"].rolling(20).std()
+    # 3. Technical Indicators (RSI, MACD, Volatility)
+    df["rsi"] = ta.rsi(df["Close"], length=14)
+    df["rsi_norm"] = df["rsi"] / 100.0  # Normalize 0-1
 
-    # Lags
-    LAGS = [1, 2, 3, 5]
-    for lag in LAGS:
-        df[f"return_lag{lag}"] = df["log_return"].shift(lag)
+    macd = ta.macd(df["Close"])
+    df["macd_hist"] = macd["MACDh_12_26_9"]
 
-    # --- 5. TARGET DEFINITION ---
-    df["target_return"] = df["log_return"].shift(-1)
-    df["price_today"] = df["Close"]
+    df["atr"] = ta.atr(df["High"], df["Low"], df["Close"], length=14)
+    df["atr_rel"] = df["atr"] / df["Close"]
 
-    # --- !!! CRITICAL FIX: SANITIZE DATA !!! ---
-    # 1. Replace Infinity with NaN (Fixes the Linear Regression crash)
-    df = df.replace([np.inf, -np.inf], np.nan)
+    df["volatility_20"] = df["return_lag1"].rolling(20).std()
 
-    # 2. Drop NaNs (drops the rows with Inf, plus the startup rows for MACD/RSI)
-    df = df.dropna().copy()
+    # 4. Create TARGET (What we want to predict)
+    # We want to predict tomorrow's return today.
+    # So we shift returns BACKWARDS by 1 day.
+    df["target_return"] = df["return_lag1"].shift(-1)
 
-    # --- 6. SPLIT DATA ---
-    split_idx = int(len(df) * (1 - TEST_RATIO))
-    val_split_idx = int(split_idx * (1 - VAL_RATIO))
+    # Keep the Close price for backtesting simulations later
+    df["close"] = df["Close"]
 
-    train_df = df.iloc[:val_split_idx]
-    val_df = df.iloc[val_split_idx:split_idx]
-    test_df = df.iloc[split_idx:]
+    # 5. Merge Sentiment (If available)
+    sent_path = DATA_DIR / "processed" / "news" / f"{ticker}_sentiment.parquet"
+    if sent_path.exists():
+        print(f"✅ Found Sentiment Data! Merging {sent_path.name}...")
+        sent_df = pd.read_parquet(sent_path)
+        # sent_df index is likely datetime, convert to date if needed
+        if isinstance(sent_df.index, pd.DatetimeIndex):
+            sent_df.index = sent_df.index.date
 
-    # --- 7. SELECT FINAL COLUMNS ---
+        df = df.join(sent_df, how="left")
+
+        # Fill missing sentiment with 0 (neutral) or forward fill
+        df["sentiment_finbert"] = df["sentiment_finbert"].fillna(0)
+
+        # Sentiment lags
+        df["sent_lag1"] = df["sentiment_finbert"].shift(1)
+        df["sent_lag2"] = df["sentiment_finbert"].shift(2)
+        df["sent_roll5"] = df["sentiment_finbert"].rolling(5).mean()
+    else:
+        print("⚠️ No sentiment data found. Skipping sentiment features.")
+
+    # 6. Drop NaNs (created by lags/rolling windows)
+    df = df.dropna()
+
+    # 7. Define Columns to Save
     feature_cols = [
         "return_lag1",
         "return_lag2",
@@ -71,16 +98,21 @@ def build_features(ticker: str = TICKER):
         "macd_hist",
         "atr_rel",
         "volatility_20",
+        "sent_lag1",
+        "sent_lag2",
+        "sent_roll5",
+        "target_return",
+        "close",
     ]
-    final_cols = feature_cols + ["target_return", "price_today"]
 
-    PROC_PRICES.mkdir(parents=True, exist_ok=True)
-    train_df[final_cols].to_parquet(PROC_PRICES / f"{ticker}_train.parquet")
-    val_df[final_cols].to_parquet(PROC_PRICES / f"{ticker}_val.parquet")
-    test_df[final_cols].to_parquet(PROC_PRICES / f"{ticker}_test.parquet")
+    # Filter only existing columns
+    final_cols = [c for c in feature_cols if c in df.columns]
 
-    print(f"Features built for {ticker} (Infinities removed!)")
-    print(f"Train Shape: {train_df.shape}")
+    out_path = DATA_DIR / "processed" / "features" / f"{ticker}_features.parquet"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    df[final_cols].to_parquet(out_path)
+    print(f"Features saved. Columns: {final_cols}")
 
 
 if __name__ == "__main__":

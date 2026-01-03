@@ -24,8 +24,8 @@ load_dotenv(
 
 
 #  If .env doesn't have values, use the defaults below
-TICKER = os.getenv("TICKER", "NFLX")  # Stock symbol we use
-START = os.getenv("PRICES_START", "2018-01-01")  # Date range for hist price data
+TICKER = os.getenv("TICKER", "AAPL")  # Stock symbol we use
+START = os.getenv("PRICES_START", "2016-01-01")  # Date range for hist price data
 END = os.getenv("PRICES_END", str(date.today()))  # Date range for hist price data
 LOOKBACK = int(os.getenv("LOOKBACK", "60"))  # How many past days LSTM looks to predict
 TEST_RATIO = float(os.getenv("TEST_RATIO", "0.2"))  # 20% test set
