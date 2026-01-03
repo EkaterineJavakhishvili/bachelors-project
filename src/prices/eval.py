@@ -15,7 +15,7 @@ TARGET = "target_return"
 
 def evaluate_and_plot(ticker: str = TICKER):
     # Load model (Swap this for 'gradient_boosting.pkl' or 'linear_regression.pkl' to test others)
-    model_name = "linear_regression.pkl"
+    model_name = "random_forest.pkl"
     model = joblib.load(MODELS_DIR / model_name)
 
     test = pd.read_parquet(PROC_PRICES / f"{ticker}_test.parquet")
