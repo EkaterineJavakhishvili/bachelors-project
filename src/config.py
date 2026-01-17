@@ -8,14 +8,13 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 RAW_PRICES = DATA_DIR / "raw" / "prices"
-INT_PRICES = DATA_DIR / "interim" / "prices"
 PROC_PRICES = DATA_DIR / "processed" / "prices"
 MODELS_DIR = PROJECT_ROOT / "models" / "price_agent"
 FIG_DIR = PROJECT_ROOT / "reports" / "figures"
 
 
 # Double checking if the folders exist (for bellow not to crush during saving)
-for d in [RAW_PRICES, INT_PRICES, PROC_PRICES, MODELS_DIR, FIG_DIR]:
+for d in [RAW_PRICES, PROC_PRICES, MODELS_DIR, FIG_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 load_dotenv(

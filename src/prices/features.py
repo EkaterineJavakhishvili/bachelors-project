@@ -1,119 +1,120 @@
+import argparse
 import pandas as pd
-import numpy as np
 import pandas_ta as ta
 from src.config import DATA_DIR
+from src.utils import load_data, standardize_columns
 
 
-def build_features(ticker="AAPL"):
-    print(f"Building features for {ticker}...")
+def build_features(ticker: str = "AAPL") -> None:
+    """
+    Main pipeline to generate technical and sentiment features.
 
-    # 1. Load Price Data
-    price_path = DATA_DIR / "raw" / "prices" / f"{ticker}.csv"
-    if not price_path.exists():
-        print(f"❌ Price data not found: {price_path}")
-        return
+    Process:
+    1. Extract: load raw prices
+    2. Transform: calculated RSI, MACD, and merge Sentiment
+    3. Load: save to Parquet
 
-    df = pd.read_csv(price_path)
+    Args:
+        ticker (str): Stock symbol to process (Defaults to "AAPL").
+    """
+    print(f"\n🏗️  STARTING FEATURE ENGINEERING FOR {ticker}...")
 
-    # --- FIX: Standardize Column Names (Handle date vs Date, close vs Close) ---
-    # This ensures the script works even if your CSV has lowercase names
-    df = df.rename(
-        columns={
-            "date": "Date",
-            "close": "Close",
-            "high": "High",
-            "low": "Low",
-            "open": "Open",
-            "volume": "Volume",
-        }
-    )
+    try:
+        # 1. load price data
+        # uses the utility function for rebust path handling
+        df = load_data("prices", f"{ticker}.parquet")
 
-    # Ensure Date is actually a column (if it was the index, reset it)
-    if "Date" not in df.columns and isinstance(df.index, pd.DatetimeIndex):
-        df = df.reset_index()
-        df = df.rename(columns={"index": "Date"})
+        if "Date" not in df.columns and df.index.name == "Date":
+            df = df.reset_index()
 
-    # ---------------------------------------------------------------------------
+        df = standardize_columns(df)
 
-    df["Date"] = pd.to_datetime(df["Date"], utc=True).dt.date
-    df = df.set_index("Date").sort_index()
+        # convert data to ensure datetime index
+        df["Date"] = pd.to_datetime(df["Date"], utc=True).dt.date
+        df = df.set_index("Date").sort_index()
 
-    # 2. Calculate Returns (Input Features)
-    df["return_lag1"] = df["Close"].pct_change()
-    df["return_lag2"] = df["Close"].pct_change(2)
-    df["return_lag3"] = df["Close"].pct_change(3)
-    df["return_lag5"] = df["Close"].pct_change(5)
+        # 2. technical indicators (vectorized for performance)
+        print("📊 Calculating technical indicators...")
+        df["return_lag1"] = df["Close"].pct_change().shift(1)
+        df["return_lag2"] = df["Close"].pct_change().shift(2)
+        df["return_lag3"] = df["Close"].pct_change().shift(3)
+        df["return_lag5"] = df["Close"].pct_change().shift(5)
 
-    # 3. Technical Indicators (RSI, MACD, Volatility)
-    df["rsi"] = ta.rsi(df["Close"], length=14)
-    df["rsi_norm"] = df["rsi"] / 100.0  # Normalize 0-1
+        # RSI (relative strength index) - normalized to 0-1
+        df["rsi"] = ta.rsi(df["Close"], length=14) / 100.0
 
-    macd = ta.macd(df["Close"])
-    df["macd_hist"] = macd["MACDh_12_26_9"]
+        # MACD (moving average convergence divergence)
+        df["macd_hist"] = ta.macd(df["Close"])["MACDh_12_26_9"]
 
-    df["atr"] = ta.atr(df["High"], df["Low"], df["Close"], length=14)
-    df["atr_rel"] = df["atr"] / df["Close"]
+        # volatility (rolling standard deviation)
+        df["volatility_20"] = df["return_lag1"].rolling(20).std()
 
-    df["volatility_20"] = df["return_lag1"].rolling(20).std()
+        # 3. create target
+        # shifting returns backward so today's features predict tomorrow's return
+        df["target_return"] = df["Close"].pct_change().shift(-1)
+        df["close"] = df["Close"]  # keep raw close price for backtesting visualization
 
-    # 4. Create TARGET (What we want to predict)
-    # We want to predict tomorrow's return today.
-    # So we shift returns BACKWARDS by 1 day.
-    df["target_return"] = df["return_lag1"].shift(-1)
+        # 4. merge sentiment
+        try:
+            print("🧠 Merging FinBERT sentiment data...")
+            sent_df = load_data("news", f"{ticker}_sentiment.parquet")
 
-    # Keep the Close price for backtesting simulations later
-    df["close"] = df["Close"]
+            # align index types
+            if isinstance(sent_df.index, pd.DatetimeIndex):
+                sent_df.index = sent_df.index.date
 
-    # 5. Merge Sentiment (If available)
-    sent_path = DATA_DIR / "processed" / "news" / f"{ticker}_sentiment.parquet"
-    if sent_path.exists():
-        print(f"✅ Found Sentiment Data! Merging {sent_path.name}...")
-        sent_df = pd.read_parquet(sent_path)
-        # sent_df index is likely datetime, convert to date if needed
-        if isinstance(sent_df.index, pd.DatetimeIndex):
-            sent_df.index = sent_df.index.date
+            # left join ensures keeping all price days, even if no news exists
+            df = df.join(sent_df, how="left")
 
-        df = df.join(sent_df, how="left")
+            # fill missing sentiment days with 0 (neutral)
+            df["sentiment_finbert"] = df["sentiment_finbert"].fillna(0)
 
-        # Fill missing sentiment with 0 (neutral) or forward fill
-        df["sentiment_finbert"] = df["sentiment_finbert"].fillna(0)
+            # lag sentiment to prevent data leakage (use yesterday's news for today's trade)
+            df["sent_lag1"] = df["sentiment_finbert"].shift(1)
 
-        # Sentiment lags
-        df["sent_lag1"] = df["sentiment_finbert"].shift(1)
-        df["sent_lag2"] = df["sentiment_finbert"].shift(2)
-        df["sent_roll5"] = df["sentiment_finbert"].rolling(5).mean()
-    else:
-        print("⚠️ No sentiment data found. Skipping sentiment features.")
+        except FileNotFoundError:
+            print("⚠️ Warning: No sentiment data found. Skipping NLP features.")
 
-    # 6. Drop NaNs (created by lags/rolling windows)
-    df = df.dropna()
+        # 5. save data
+        df = df.dropna()
 
-    # 7. Define Columns to Save
-    feature_cols = [
-        "return_lag1",
-        "return_lag2",
-        "return_lag3",
-        "return_lag5",
-        "rsi_norm",
-        "macd_hist",
-        "atr_rel",
-        "volatility_20",
-        "sent_lag1",
-        "sent_lag2",
-        "sent_roll5",
-        "target_return",
-        "close",
-    ]
+        # select only the columns needed for the model
+        cols = [
+            "return_lag1",
+            "return_lag2",
+            "return_lag3",
+            "return_lag5",
+            "rsi",
+            "macd_hist",
+            "volatility_20",
+            "sent_lag1",
+            "target_return",
+            "close",
+        ]
+        final_cols = [c for c in cols if c in df.columns]
 
-    # Filter only existing columns
-    final_cols = [c for c in feature_cols if c in df.columns]
+        out_path = DATA_DIR / "processed" / "features" / f"{ticker}_features.parquet"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    out_path = DATA_DIR / "processed" / "features" / f"{ticker}_features.parquet"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+        df[final_cols].to_parquet(out_path)
 
-    df[final_cols].to_parquet(out_path)
-    print(f"Features saved. Columns: {final_cols}")
+        print(f"✅ SUCCESS: Features saved to {out_path.name}")
+
+    except Exception as e:
+        print(f"❌ ERROR in Feature Engineering: {e}")
 
 
 if __name__ == "__main__":
-    build_features()
+    # allow different scenarios via CLI arguments
+    parser = argparse.ArgumentParser(
+        description="Generate features for a specific stock."
+    )
+    parser.add_argument(
+        "--ticker",
+        type=str,
+        default="AAPL",
+        help="The stock symbol to process (default: AAPL)",
+    )
+
+    args = parser.parse_args()
+    build_features(ticker=args.ticker)

@@ -1,34 +1,38 @@
-# --- System & Environment ---
+# --- Python & System ---
 __pycache__/
-*.py[cod]
+*.pyc
 .DS_Store
-.venv/
+venv/
+env/
 .env
+.vscode/
+workspace/
+.venv/
 *.code-workspace
 
-# --- Editor Configs ---
-.vscode/
-.idea/
-*.swp
-
-# --- DATA FILES (Ignore contents, keep folders) ---
-# Ignore all heavy data files globally
+# --- Large Data Files (Excluded) ---
 *.csv
 *.parquet
-*.pkl
 *.h5
+*.keras
 *.zip
 
-# Specific exclusions for data folder (redundant but safe)
-data/raw/**/*.csv
-data/interim/**/*.parquet
-data/processed/**/*.parquet
+# --- Models (Excluded) ---
+*.pkl
+models/**/*.pkl
+models/**/*.keras
 
-# --- MODELS (Ignore large binaries) ---
-models/*.pkl
-models/*.joblib
-models/*.keras
+# --- Reports & Figures (Excluded) ---
+reports/figures/*.png
+reports/figures/*.pdf
+reports/figures/*.jpg
 
-# --- EXCEPTIONS (Important!) ---
-# Do NOT ignore .gitkeep files
-!.gitkeep
+# --- BUT: Keep the Folder Structure! ---
+# Ignore everything in these folders...
+data/raw/*
+data/processed/*
+models/price_agent/*
+reports/figures/*
+
+# ...EXCEPT the .gitkeep files (This forces Git to upload the empty folder)
+!**/.gitkeep

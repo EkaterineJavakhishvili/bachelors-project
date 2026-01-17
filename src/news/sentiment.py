@@ -1,97 +1,139 @@
+import argparse
 import pandas as pd
-import numpy as np
 import torch
+import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from tqdm import tqdm
 from src.config import DATA_DIR
 
-# Industry-standard Financial BERT model
+# industry standard Financial BERT model
 MODEL_NAME = "ProsusAI/finbert"
 
 
-def load_finbert():
-    print(f"⏳ Loading FinBERT model: {MODEL_NAME}...")
+def get_device():
+    """
+    Auto detects the best available hardware accelerator.
+    """
+    if torch.backends.mps.is_available():
+        return torch.device("mps")  # Mac M1/M2/M3
+    elif torch.cuda.is_available():
+        return torch.device("cuda")  # NVIDIA GPU
+    else:
+        return torch.device("cpu")  # Standard CPU
+
+
+def load_finbert(device):
+    """
+    Loads the FinBERT model and moves it to the accelerator
+    """
+    print(f"⏳ Loading FinBERT model ({device})...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
+    model.to(device)
+    model.eval()
     return tokenizer, model
 
 
-def get_sentiment_score(headlines, tokenizer, model):
+def process_news(ticker: str = "AAPL", input_file: str = "apple_news_data.csv"):
     """
-    Scoring a batch of headlines.
-    Returns a scalar: +1 (Positive) to -1 (Negative).
+    Main pipeline: Loads CSV -> Runs FinBERT -> Saves Daily Sentiment.
     """
-    if not headlines:
-        return 0.0
 
-    # Tokenize
-    inputs = tokenizer(
-        headlines, return_tensors="pt", padding=True, truncation=True, max_length=64
-    )
+    # 1. setup device
+    device = get_device()
+    print(f"🚀 Acceleration Status: Running on {device.type.upper()}")
 
-    with torch.no_grad():
-        outputs = model(**inputs)
-        scores = torch.nn.functional.softmax(outputs.logits, dim=1)
+    # 2. load data
+    raw_news_path = DATA_DIR / "raw" / "news" / input_file
 
-    # FinBERT Output Mapping: 0=Positive, 1=Negative, 2=Neutral
-    # We convert this to a single signal: (Positive * 1) + (Negative * -1)
-    sentiment_vals = (scores[:, 0] * 1) + (scores[:, 1] * -1)
-
-    return sentiment_vals.mean().item()
-
-
-def process_news():
-    # 1. Load the Kaggle CSV
-    news_path = DATA_DIR / "raw" / "news" / "apple_news_data.csv"
-
-    if not news_path.exists():
-        print(f"❌ Error: File not found at {news_path}")
+    if not raw_news_path.exists():
+        print(f"❌ Error: File not found at {raw_news_path}")
+        print("   Please ensure your dataset is in 'data/raw/news/'")
         return
 
-    print(f"Loading news from {news_path}...")
-    # on_bad_lines='skip' handles formatting errors in the CSV
-    df = pd.read_csv(news_path, on_bad_lines="skip")
+    print(f"📂 Loading data from {raw_news_path.name}...")
+    df = pd.read_csv(raw_news_path, on_bad_lines="skip")
 
-    # 2. Clean Dates (Handling ISO format with Timezone T...Z)
-    # utc=True is required because your data has "+00:00"
+    # 3. cleaning dates (Handling ISO formats and timezones standardizes the join key)
     df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True).dt.date
-
-    # Clean rows
     df = df.dropna(subset=["date", "title"])
     df = df.sort_values("date")
 
-    print(f"✅ Data Loaded. Range: {df['date'].min()} to {df['date'].max()}")
-    print(f"Total Headlines: {len(df)}")
+    print(f"   Date Range: {df['date'].min()} to {df['date'].max()}")
+    print(f"   Total Headlines: {len(df):,}")
 
-    # 3. Setup FinBERT
-    tokenizer, model = load_finbert()
+    # 4. initialize model
+    tokenizer, model = load_finbert(device)
 
-    print("🧠 Scoring headlines with FinBERT (This is the slow part)...")
+    # 5. group by date
+    print("🧠 Analyzing sentiment (this may take time)...")
 
-    # Group by Date
     daily_groups = df.groupby("date")["title"].apply(list)
     results = []
 
-    # 4. Inference Loop
-    for date, headlines in tqdm(daily_groups.items(), total=len(daily_groups)):
-        # Optimization: Take top 20 headlines/day to speed up processing
-        daily_score = get_sentiment_score(headlines[:20], tokenizer, model)
+    for date, headlines in tqdm(
+        daily_groups.items(), total=len(daily_groups), unit="day"
+    ):
+        # optimization: limit to top 20 headlines per day to prevent memory crashes
+        batch = headlines[:20]
+
+        if not batch:
+            results.append({"date": date, "sentiment_finbert": 0.0})
+            continue
+
+        # tokenize
+        inputs = tokenizer(
+            batch, return_tensors="pt", padding=True, truncation=True, max_length=64
+        ).to(device)
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+            # softmax to get probabilities (0-1)
+            scores = F.softmax(outputs.logits, dim=1)
+
+        # FinBERT Labels: [Positive, Negative, Neutral] (Standard for ProsusAI)
+        # Score = (Prob_Pos * 1) + (Prob_Neg * -1)
+        # Neutral contributes 0.
+        sentiment_vals = (scores[:, 0] * 1) + (scores[:, 1] * -1)
+
+        # average sentiment for the day
+        daily_score = sentiment_vals.mean().item()
         results.append({"date": date, "sentiment_finbert": daily_score})
 
-    # 5. Save
-    sentiment_df = pd.DataFrame(results)
-    sentiment_df["date"] = pd.to_datetime(
-        sentiment_df["date"]
-    )  # Ensure datetime format for merging
-    sentiment_df = sentiment_df.set_index("date")
+        # 6. save results
+        sent_df = pd.DataFrame(results)
 
-    out_path = DATA_DIR / "processed" / "news" / "AAPL_sentiment.parquet"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    sentiment_df.to_parquet(out_path)
+        sent_df["date"] = pd.to_datetime(sent_df["date"])
+        sent_df = sent_df.set_index("date")
 
-    print(f"✅ Sentiment Signal Saved -> {out_path}")
-    print(sentiment_df.tail())
+        out_path = DATA_DIR / "processed" / "news" / f"{ticker}_sentiment.parquet"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        sent_df.to_parquet(out_path)
+
+        print(f"✅ SUCCESS: Sentiment data saved to {out_path}")
+        print(sent_df.tail())
 
 
 if __name__ == "__main__":
-    process_news()
+    parser = argparse.ArgumentParser(
+        description="Generate Sentiment Features using FinBERT."
+    )
+
+    parser.add_argument(
+        "--ticker",
+        type=str,
+        default="AAPL",
+        help="Ticker symbol for the output filename (e.g., AAPL)",
+    )
+
+    parser.add_argument(
+        "--file",
+        type=str,
+        default="apple_news_data.csv",
+        help="Filename of the raw CSV in data/raw/news/",
+    )
+
+    args = parser.parse_args()
+
+    process_news(ticker=args.ticker, input_file=args.file)
